@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Smart Parking System — Real-time monitoring dashboard dengan Fuzzy Logic dan IoT" />
+  <title>🅿️ Smart Parking Monitor</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🅿️</text></svg>" />
+
+  <!-- Paho MQTT Client untuk WebSockets -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js" type="text/javascript"></script>
+</head>
+<body>
+
+  <div class="container">
+
+    <!-- ═══ HEADER ═══ -->
+    <header class="header" id="header">
+      <span class="header-icon">🅿️</span>
+      <h1>Smart Parking Monitor</h1>
+      <p>Real-time Dashboard &bull; Fuzzy Logic &bull; MQTT IoT</p>
+      <div class="connection-badge disconnected" id="connection-badge">
+        <span class="connection-dot"></span>
+        <span id="connection-text">Menghubungkan ke MQTT...</span>
+      </div>
+    </header>
+
+    <!-- ═══ SUMMARY CARDS ═══ -->
+    <section class="summary-grid" id="summary-section">
+      <div class="summary-card total" id="card-total">
+        <div class="summary-label">Total Slot</div>
+        <div class="summary-value" id="summary-total">—</div>
+        <div class="summary-sub">Kapasitas parkir</div>
+      </div>
+      <div class="summary-card available" id="card-available">
+        <div class="summary-label">Tersedia</div>
+        <div class="summary-value" id="summary-available">—</div>
+        <div class="summary-sub">Slot kosong</div>
+      </div>
+      <div class="summary-card occupied" id="card-occupied">
+        <div class="summary-label">Terisi</div>
+        <div class="summary-value" id="summary-occupied">—</div>
+        <div class="summary-sub">Slot terpakai</div>
+      </div>
+      <div class="summary-card recommended" id="card-recommended">
+        <div class="summary-label">Rekomendasi</div>
+        <div class="summary-value" id="summary-recommended">—</div>
+        <div class="summary-sub">Slot terbaik (Fuzzy)</div>
+      </div>
+    </section>
+
+    <!-- ═══ SLOT STATUS ═══ -->
+    <div class="section-title">
+      <span class="icon">📡</span> Status Slot Parkir
+    </div>
+    <section class="slot-grid" id="slot-section">
+      <div id="loading-slots" style="text-align: center; color: var(--text-muted); width: 100%; grid-column: 1 / -1; padding: 2rem;">
+        Menunggu data sensor dari alat ESP32...
+      </div>
+      <!-- Slot cards will be dynamically generated here -->
+    </section>
+
+    <!-- ═══ ACTIVITY LOG ═══ -->
+    <section class="log-section">
+      <div class="section-title">
+        <span class="icon">📋</span> Log Aktivitas RFID (Live)
+      </div>
+      <div class="log-wrapper">
+        <div class="log-table-scroll">
+          <table id="log-table">
+            <thead>
+              <tr>
+                <th>Waktu</th>
+                <th>UID Kartu</th>
+                <th>Status</th>
+                <th>Gate</th>
+                <th>Rekomendasi</th>
+              </tr>
+            </thead>
+            <tbody id="log-body">
+              <tr id="empty-log-row">
+                <td colspan="5" class="log-empty">
+                  <span class="icon">📭</span>
+                  Belum ada aktivitas tercatat sejak halaman dibuka
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ LAST UPDATE ═══ -->
+    <div class="last-update" id="last-update">
+      Menunggu data MQTT...
+    </div>
+
+  </div>
+
+  <script>
+    // ════════════════════════════════════════════════════════
+    //  MQTT CONFIGURATION — WebSockets
+    // ════════════════════════════════════════════════════════
+    const MQTT_BROKER = "broker.hivemq.com";
+    const MQTT_PORT = 8000; // HiveMQ WebSockets port (JANGAN UBAH KE 1883 UNTUK WEB)
+    
+    // Generate random client ID to avoid collision
+    const clientId = "web-dashboard-" + Math.floor(Math.random() * 100000);
+    
+    // MQTT Topics yang dipublish oleh ESP32
+    const TOPIC_SLOT = "parkir/slot/status";
+    const TOPIC_GATE = "parkir/gate/event";
+    const TOPIC_SYS  = "parkir/system/online";
+
+    // ════════════════════════════════════════════════════════
+    //  STATE
+    // ════════════════════════════════════════════════════════
+    let slotsData = {};
+    let currentRecommended = -1;
+    let totalSlotsCount = 0;
+    
+    // ════════════════════════════════════════════════════════
+    //  INIT MQTT CLIENT
+    // ════════════════════════════════════════════════════════
+    const client = new Paho.MQTT.Client(MQTT_BROKER, MQTT_PORT, clientId);
+
+    client.onConnectionLost = onConnectionLost;
+    client.onMessageArrived = onMessageArrived;
+
+    const options = {
+      timeout: 3,
+      onSuccess: onConnect,
+      onFailure: onFailure,
+    };
+    
+    console.log("Connecting to MQTT broker...");
+    client.connect(options);
+
+    // ════════════════════════════════════════════════════════
+    //  MQTT CALLBACKS
+    // ════════════════════════════════════════════════════════
+    function onConnect() {
+      console.log("Connected to MQTT!");
+      updateConnectionStatus(true);
+
+      client.subscribe(TOPIC_SLOT);
+      client.subscribe(TOPIC_GATE);
+      client.subscribe(TOPIC_SYS);
+    }
+
+    function onFailure(responseObject) {
+      console.log("Connection failed: " + responseObject.errorMessage);
+      updateConnectionStatus(false);
+      setTimeout(() => client.connect(options), 5000); // Reconnect
+    }
+
+    function onConnectionLost(responseObject) {
+      if (responseObject.errorCode !== 0) {
+        console.log("Connection lost: " + responseObject.errorMessage);
+        updateConnectionStatus(false);
+        setTimeout(() => client.connect(options), 5000); // Reconnect
+      }
+    }
+
+    function updateConnectionStatus(isConnected) {
+      const badge = document.getElementById('connection-badge');
+      const text = document.getElementById('connection-text');
+      if (isConnected) {
+        badge.className = 'connection-badge connected';
+        text.textContent = 'Terhubung ke MQTT';
+      } else {
+        badge.className = 'connection-badge disconnected';
+        text.textContent = 'Terputus (Menghubungkan ulang...)';
+      }
+    }
+
+    function onMessageArrived(message) {
+      const topic = message.destinationName;
+      const payload = message.payloadString;
+      
+      try {
+        const data = JSON.parse(payload);
+        
+        if (topic === TOPIC_SYS) {
+          if (data.status === "online") {
+             console.log("ESP32 is online!");
+          } else {
+             console.log("ESP32 is offline!");
+          }
+        } 
+        else if (topic === TOPIC_SLOT) {
+          slotsData[data.slot] = data;
+          
+          currentRecommended = -1;
+          let highestPriority = -1;
+          Object.values(slotsData).forEach(s => {
+             if (!s.occupied && s.priority > highestPriority) {
+                 highestPriority = s.priority;
+                 currentRecommended = s.slot;
+             }
+          });
+          
+          totalSlotsCount = data.total || 2;
+          
+          updateSlotsUI();
+          updateSummaryUI(data.available, totalSlotsCount);
+          
+          document.getElementById('last-update').textContent = 'Terakhir diperbarui: ' + new Date().toLocaleTimeString('id-ID');
+        } 
+        else if (topic === TOPIC_GATE) {
+          addLogEntry(data);
+        }
+        
+      } catch (e) {
+        console.log("Error parsing JSON message", e);
+      }
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  UI UPDATE FUNCTIONS
+    // ════════════════════════════════════════════════════════
+    function updateSummaryUI(available, total) {
+      animateValue('summary-total', total);
+      animateValue('summary-available', available);
+      animateValue('summary-occupied', total - available);
+
+      const recEl = document.getElementById('summary-recommended');
+      if (currentRecommended > 0) {
+        recEl.innerHTML = 'Slot ' + currentRecommended;
+      } else {
+        recEl.innerHTML = '—';
+      }
+    }
+
+    function updateSlotsUI() {
+      const container = document.getElementById('slot-section');
+      
+      const loading = document.getElementById('loading-slots');
+      if (loading) loading.remove();
+
+      let html = '';
+      
+      const keys = Object.keys(slotsData).sort((a,b) => parseInt(a) - parseInt(b));
+
+      for (const label of keys) {
+        const slot = slotsData[label];
+        const isAvailable = !slot.occupied;
+        const statusClass = isAvailable ? 'available' : 'occupied';
+        const statusText = isAvailable ? 'TERSEDIA' : 'TERISI';
+        const statusEmoji = isAvailable ? '🟢' : '🔴';
+        const isRecommended = (parseInt(label) === currentRecommended);
+
+        const muTerisi = parseFloat(slot.muTerisi) || 0;
+        const muRagu = parseFloat(slot.muRagu) || 0;
+        const muKosong = parseFloat(slot.muKosong) || 0;
+        const priority = parseFloat(slot.priority) || 0;
+        const distance = slot.distance || 0;
+
+        html += `
+          <div class="slot-card ${statusClass}" id="slot-card-${label}">
+            <div class="slot-header">
+              <span class="slot-number">Slot ${label}</span>
+              <span class="slot-badge">${statusText}</span>
+            </div>
+
+            <div class="slot-indicator">${statusEmoji}</div>
+
+            <div class="slot-distance">
+              <span class="value">${distance > 0 ? distance : '—'}</span><span class="unit">cm</span>
+              <span class="label">Jarak Sensor</span>
+            </div>
+
+            <div class="fuzzy-section">
+              <div class="fuzzy-bar">
+                <span class="fuzzy-label">μ Terisi</span>
+                <div class="bar-track">
+                  <div class="bar-fill terisi" style="width: ${muTerisi * 100}%"></div>
+                </div>
+                <span class="bar-value">${muTerisi.toFixed(2)}</span>
+              </div>
+              <div class="fuzzy-bar">
+                <span class="fuzzy-label">μ Ragu</span>
+                <div class="bar-track">
+                  <div class="bar-fill ragu" style="width: ${muRagu * 100}%"></div>
+                </div>
+                <span class="bar-value">${muRagu.toFixed(2)}</span>
+              </div>
+              <div class="fuzzy-bar">
+                <span class="fuzzy-label">μ Kosong</span>
+                <div class="bar-track">
+                  <div class="bar-fill kosong" style="width: ${muKosong * 100}%"></div>
+                </div>
+                <span class="bar-value">${muKosong.toFixed(2)}</span>
+              </div>
+            </div>
+
+            <div class="slot-priority">
+              <span class="label">Prioritas Fuzzy</span>
+              <span class="value ${isRecommended ? 'recommended' : ''}">
+                ${priority.toFixed(3)}
+                ${isRecommended ? '<span class="recommended-star">⭐</span>' : ''}
+              </span>
+            </div>
+          </div>
+        `;
+      }
+
+      container.innerHTML = html;
+    }
+
+    function addLogEntry(log) {
+      const tbody = document.getElementById('log-body');
+      
+      const emptyRow = document.getElementById('empty-log-row');
+      if (emptyRow) emptyRow.remove();
+
+      let time = new Date().toLocaleTimeString('id-ID');
+      if (log.timestamp && log.timestamp > 1700000000) {
+        time = new Date(log.timestamp * 1000).toLocaleTimeString('id-ID');
+      }
+
+      const statusClass = log.allowed ? 'allowed' : 'denied';
+      const statusText = log.allowed ? '✓ Diizinkan' : '✗ Ditolak';
+      const gateClass = log.gateOpened ? 'opened' : 'closed';
+      const gateText = log.gateOpened ? '🚧 Terbuka' : '— Tertutup';
+      const recText = log.recommendedSlot > 0 ? 'Slot ' + log.recommendedSlot : '—';
+
+      const tr = document.createElement('tr');
+      tr.className = 'log-row-new';
+      tr.innerHTML = `
+        <td>${time}</td>
+        <td><span class="log-uid">${log.uid || '—'}</span></td>
+        <td><span class="log-status ${statusClass}">${statusText}</span></td>
+        <td><span class="log-gate ${gateClass}">${gateText}</span></td>
+        <td>${recText}</td>
+      `;
+      
+      tbody.insertBefore(tr, tbody.firstChild);
+      
+      if (tbody.children.length > 50) {
+         tbody.removeChild(tbody.lastChild);
+      }
+    }
+
+    function animateValue(elementId, newValue) {
+      const el = document.getElementById(elementId);
+      if (!el) return;
+
+      const oldValue = el.textContent;
+      el.textContent = newValue;
+
+      if (oldValue !== '—' && oldValue !== String(newValue)) {
+        el.style.transition = 'none';
+        el.style.transform = 'scale(1.15)';
+        requestAnimationFrame(() => {
+          el.style.transition = 'transform 0.4s cubic-bezier(0.4, 0, 0.2, 1)';
+          el.style.transform = 'scale(1)';
+        });
+      }
+    }
+  </script>
+
+</body>
+</html>
